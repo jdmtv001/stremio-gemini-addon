@@ -61,6 +61,11 @@ function getBaseUrl(req) {
 
 // --- Stremio Addon Endpoints ---
 
+// NEW: Redirect root path to the /configure page
+app.get('/', (req, res) => {
+    res.redirect('/configure');
+});
+
 /**
  * Serves the Stremio Addon manifest file.
  * This file describes the addon's capabilities to Stremio.
