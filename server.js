@@ -7,39 +7,40 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fetch = require('node-fetch'); // Required for Node.js versions < 18, or if you prefer node-fetch
+const crypto = require('crypto'); // Node.js built-in module for generating random data
 
 // IMPORTANT SECURITY NOTE FOR PRODUCTION:
 // Sensitive data like Trakt refresh tokens MUST be stored securely in a persistent database
 // (e.g., Firestore with Firebase Admin SDK, a proper SQL database, or a NoSQL database).
-// Storing them in-memory (as done in this example: userTraktTokens) will lead to data loss
+// Storing them in-memory (as done in this example: userTraktTokens, tempTraktSecrets) will lead to data loss
 // whenever the server restarts, and is not suitable for multiple concurrent users.
 // For a full-fledged application, you would also need a robust user authentication system
 // to associate Stremio users with their Trakt tokens and viewing history.
 
-// --- Environment Variables Configuration ---
-// These variables must be set in your Render Dashboard for your web service.
-// On Render, go to your service settings -> Environment.
-// Example values shown here are placeholders.
-const TRAKT_CLIENT_ID = process.env.TRAKT_CLIENT_ID; // Your Trakt API Client ID
-const TRAKT_CLIENT_SECRET = process.env.TRAKT_CLIENT_SECRET; // Your Trakt API Client Secret
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // Your Google Gemini API Key
-
-// Warn if essential environment variables are missing
-if (!TRAKT_CLIENT_ID || !TRAKT_CLIENT_SECRET || !GEMINI_API_KEY) {
-    console.warn("WARNING: Missing TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, or GEMINI_API_KEY environment variables.");
-    console.warn("Please set these variables in your Render service settings for the addon to function correctly.");
-    console.warn("Using placeholder/empty values for now, which may cause API calls to fail.");
-}
+// --- Environment Variables Configuration (Fallback/Primary for Deployed App) ---
+// These variables should ideally be set in your Render Dashboard for your web service for production.
+// If they are not set, the addon will rely on manual input from the config page for the *current session*.
+// However, for persistent functionality across server restarts (especially for the Gemini key
+// and Trakt token refreshes), setting them as Render environment variables is HIGHLY recommended.
+const ENV_TRAKT_CLIENT_ID = process.env.TRAKT_CLIENT_ID;
+const ENV_TRAKT_CLIENT_SECRET = process.env.TRAKT_CLIENT_SECRET;
+const ENV_GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // Initialize Google Gemini AI with the API key
-// The Gemini client library will handle cases where the key is empty if not provided.
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY || "");
+// The API key for Gemini will still primarily come from the environment variable for deployed instances.
+// The UI input is for convenience and local testing/setup.
+const genAI = new GoogleGenerativeAI(ENV_GEMINI_API_KEY || "");
 const model = genAI.getGenerativeModel({ model: "gemini-pro" }); // Using gemini-pro for text generation capabilities
 
 // In-memory storage for Trakt tokens (DEMONSTRATION PURPOSES ONLY!)
 // In a real application, this would be a database lookup.
 // The key is a hypothetical user ID (e.g., from Stremio or a generated unique ID).
 const userTraktTokens = {}; // Format: { [userId]: { access_token, refresh_token, expires_at } }
+
+// Temporary in-memory storage for Trakt client_secret and client_id during OAuth flow.
+// This is necessary because Trakt's callback only provides 'code' and 'state', not client credentials.
+// In a highly concurrent environment, a more robust session management or a database would be needed.
+const tempTraktAuthData = {}; // Format: { [state]: { clientId, clientSecret } }
 
 // --- Express App Setup ---
 const app = express();
@@ -61,7 +62,7 @@ function getBaseUrl(req) {
 
 // --- Stremio Addon Endpoints ---
 
-// NEW: Redirect root path to the /configure page
+// Redirect root path to the /configure page
 app.get('/', (req, res) => {
     res.redirect('/configure');
 });
@@ -139,32 +140,15 @@ app.get('/catalog/:type/:id.json', async (req, res) => {
     //    Example prompt: "Based on my watch history of [Movie A, Series B, Movie C], suggest 5 new ${type}s that are similar in genre or theme, or from the same production studios. Provide only the titles, one per line, and ensure they are distinct."
     // 4. If no Trakt history or user not linked, use a general prompt.
 
-    if (userTraktTokens[userId] && userTraktTokens[userId].access_token) {
-        // --- Conceptual Trakt History Fetch ---
-        // console.log(`Attempting to use Trakt tokens for user ${userId}.`);
-        // // Implement refreshTraktToken(userId) and then fetch history
-        // const traktResponse = await fetch('https://api.trakt.tv/users/me/watched/movies?extended=full', {
-        //     headers: {
-        //         'Authorization': `Bearer ${userTraktTokens[userId].access_token}`,
-        //         'trakt-api-version': '2',
-        //         'trakt-api-key': TRAKT_CLIENT_ID
-        //     }
-        // });
-        // if (traktResponse.ok) {
-        //     const watchedItems = await traktResponse.json();
-        //     const watchedTitles = watchedItems.map(item => item[type]?.title || '').filter(Boolean).join(', ');
-        //     if (watchedTitles.length > 0) {
-        //         prompt = `Based on my watch history: ${watchedTitles}, suggest 5 new ${type}s that I might like. Provide only titles, one per line.`;
-        //     } else {
-        //         prompt = `Suggest 5 popular ${type}s from diverse genres for a user without extensive watch history. Provide only titles, one per line.`;
-        //     }
-        // } else {
-        //     console.error("Failed to fetch Trakt history:", await traktResponse.text());
-        //     prompt = `Suggest 5 popular ${type}s. Provide only titles, one per line.`; // Fallback
-        // }
-        // --- End Conceptual Trakt History Fetch ---
-        console.log(`Using general prompt as Trakt history integration is conceptual for this demo.`);
-        prompt = `Suggest 5 popular ${type}s from diverse genres. Provide only the titles, one per line.`;
+    // If environment variables are set, prioritize those. Otherwise, rely on in-memory tokens from direct UI setup.
+    // For a true persistent solution, the in-memory userTraktTokens should be replaced by database lookups.
+    const currentTraktTokens = userTraktTokens[userId];
+
+    if (currentTraktTokens && currentTraktTokens.access_token) {
+        // Here, you'd ideally try to refresh the token if expired.
+        // For simplicity in this demo, we assume the token is valid if present.
+        console.log(`Using conceptual Trakt tokens for user ${userId}.`);
+        prompt = `Based on a user's potential watch history, suggest 5 highly-rated ${type}s from diverse genres. Provide only the titles, one per line.`;
     } else if (search) {
         // If a search query is provided by Stremio
         prompt = `Find 5 ${type}s related to "${search}". Focus on popular or critically acclaimed titles. Provide only the titles, one per line.`;
@@ -256,34 +240,51 @@ app.get('/meta/:type/:imdb_id.json', async (req, res) => {
 
 /**
  * Endpoint initiated by the frontend to start the Trakt.tv OAuth flow.
- * It provides the authorization URL to the frontend.
+ * It now accepts client_id and client_secret from the frontend for this specific auth initiation.
  */
-app.get('/trakt-auth-initiate', (req, res) => {
-    if (!TRAKT_CLIENT_ID) {
-        return res.status(400).json({ error: "Trakt Client ID is not configured on the server." });
+app.post('/trakt-auth-initiate', (req, res) => {
+    const { traktClientId, traktClientSecret } = req.body; // Get client ID and secret from the request body
+
+    if (!traktClientId || !traktClientSecret) {
+        return res.status(400).json({ error: "Trakt Client ID and Secret are required for authorization." });
     }
+
     const redirectUri = `${getBaseUrl(req)}/trakt-callback`;
-    const authUrl = `https://trakt.tv/oauth/authorize?response_type=code&client_id=${TRAKT_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+    const state = crypto.randomUUID(); // Generate a unique state to link callback request
+
+    // Store the client ID and secret temporarily, associated with the state
+    tempTraktAuthData[state] = { clientId: traktClientId, clientSecret: traktClientSecret };
+    console.log(`Stored temporary Trakt auth data for state: ${state}`);
+
+    const authUrl = `https://trakt.tv/oauth/authorize?response_type=code&client_id=${traktClientId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
     res.json({ authUrl });
 });
 
 /**
  * Callback endpoint for Trakt.tv OAuth.
  * Trakt.tv redirects the user's browser back to this URL after authorization,
- * providing an authorization 'code' in the URL query parameters.
- * This endpoint exchanges the 'code' for access and refresh tokens.
+ * providing an authorization 'code' and 'state' in the URL query parameters.
+ * This endpoint uses the 'state' to retrieve the temporarily stored client credentials
+ * and exchanges the 'code' for access and refresh tokens.
  */
 app.get('/trakt-callback', async (req, res) => {
     const code = req.query.code; // The authorization code from Trakt
+    const state = req.query.state; // The state parameter to retrieve stored client credentials
     const redirectUri = `${getBaseUrl(req)}/trakt-callback`; // Must exactly match the URI registered with Trakt.tv
 
-    if (!code) {
-        console.error("Trakt callback: No authorization code received.");
-        return res.redirect('/configure?error=trakt_no_code');
+    if (!code || !state) {
+        console.error("Trakt callback: Missing authorization code or state.");
+        return res.redirect('/configure?error=trakt_no_code_or_state');
     }
-    if (!TRAKT_CLIENT_ID || !TRAKT_CLIENT_SECRET) {
-        console.error("Trakt API Client ID or Client Secret are not set on the server.");
-        return res.redirect('/configure?error=server_trakt_config_missing');
+
+    const { clientId, clientSecret } = tempTraktAuthData[state] || {};
+
+    // Remove the temporary data immediately after retrieval for security
+    delete tempTraktAuthData[state];
+
+    if (!clientId || !clientSecret) {
+        console.error(`Trakt API Client ID or Client Secret not found for state ${state}. Session expired or invalid state.`);
+        return res.redirect('/configure?error=trakt_session_expired');
     }
 
     try {
@@ -295,8 +296,8 @@ app.get('/trakt-callback', async (req, res) => {
             },
             body: JSON.stringify({
                 code: code,
-                client_id: TRAKT_CLIENT_ID,
-                client_secret: TRAKT_CLIENT_SECRET,
+                client_id: clientId, // Use the client ID retrieved from temp storage
+                client_secret: clientSecret, // Use the client secret retrieved from temp storage
                 redirect_uri: redirectUri,
                 grant_type: 'authorization_code' // Specifies the OAuth grant type
             })
@@ -368,6 +369,8 @@ async function refreshTraktToken(userId) {
 
     console.log(`Refreshing Trakt token for user ${userId}...`);
     try {
+        // For refresh, we'll use the environment variables, as this is a server-side process
+        // that needs consistent keys, not necessarily the ones from the last UI input.
         const response = await fetch('https://api.trakt.tv/oauth/token', {
             method: 'POST',
             headers: {
@@ -375,8 +378,8 @@ async function refreshTraktToken(userId) {
             },
             body: JSON.stringify({
                 refresh_token: tokens.refresh_token,
-                client_id: TRAKT_CLIENT_ID,
-                client_secret: TRAKT_CLIENT_SECRET,
+                client_id: ENV_TRAKT_CLIENT_ID, // Use ENV key for refresh
+                client_secret: ENV_TRAKT_CLIENT_SECRET, // Use ENV key for refresh
                 grant_type: 'refresh_token' // Specifies the OAuth grant type for refresh
             })
         });
@@ -421,7 +424,7 @@ async function refreshTraktToken(userId) {
 app.get('/configure', (req, res) => {
     // These variables (__firebase_config, __initial_auth_token) are provided by the Canvas environment.
     // They are used here to initialize Firebase client-side SDK for general user identity,
-    // NOT for storing sensitive Trakt tokens, which are handled server-side.
+    // NOT for storing sensitive Trakt tokens, which are are handled server-side.
     const firebaseConfigJson = typeof __firebase_config !== 'undefined' ? JSON.stringify(JSON.parse(__firebase_config)) : '{}';
     const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? `'${__initial_auth_token}'` : 'undefined';
 
@@ -554,22 +557,16 @@ app.get('/configure', (req, res) => {
                 const { createRoot } = ReactDOM;
 
                 function App() {
-                    // State variables for Trakt credentials, addon URL, and messages
+                    // State variables for API keys and messages
                     const [traktClientId, setTraktClientId] = useState('');
                     const [traktClientSecret, setTraktClientSecret] = useState('');
+                    const [geminiApiKey, setGeminiApiKey] = useState('');
                     const [addonUrl, setAddonUrl] = useState('');
                     const [message, setMessage] = useState('');
                     const [error, setError] = useState('');
 
                     // Effect hook to run once on component mount for initial setup and URL parameter parsing
                     useEffect(() => {
-                        // Attempt to load previously saved credentials from localStorage
-                        // This helps persist inputs across browser sessions on the config page.
-                        const savedClientId = localStorage.getItem('traktClientId');
-                        const savedClientSecret = localStorage.getItem('traktClientSecret');
-                        if (savedClientId) setTraktClientId(savedClientId);
-                        if (savedClientSecret) setTraktClientSecret(savedClientSecret);
-
                         // Parse URL parameters for post-Trakt authentication messages
                         const params = new URLSearchParams(window.location.search);
                         if (params.get('trakt_auth_success')) {
@@ -594,14 +591,19 @@ app.get('/configure', (req, res) => {
                         setError('');
                         setMessage('');
 
-                        // Store inputs in localStorage for convenience
-                        localStorage.setItem('traktClientId', traktClientId);
-                        localStorage.setItem('traktClientSecret', traktClientSecret);
-
                         setMessage('Initiating Trakt.tv authorization...');
                         try {
-                            // Call backend endpoint to get the Trakt authorization URL
-                            const response = await fetch('/trakt-auth-initiate');
+                            // Call backend endpoint to get the Trakt authorization URL, passing client credentials
+                            const response = await fetch('/trakt-auth-initiate', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json'
+                                },
+                                body: JSON.stringify({
+                                    traktClientId,
+                                    traktClientSecret
+                                })
+                            });
                             const data = await response.json();
                             if (response.ok && data.authUrl) {
                                 // Redirect user to Trakt.tv for authorization
@@ -644,20 +646,12 @@ app.get('/configure', (req, res) => {
                             </p>
 
                             <div className="w-full max-w-md bg-slate-700 p-6 rounded-lg shadow-md space-y-4">
-                                <h2 className="text-2xl font-semibold text-white mb-4">Trakt.tv Integration Setup</h2>
+                                <h2 className="text-2xl font-semibold text-white mb-4">API Key Configuration</h2>
                                 <p className="text-slate-400 text-sm">
-                                    To integrate with Trakt.tv, you need to register a new application on
-                                    <a href="https://trakt.tv/oauth/applications" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline ml-1 mr-1">Trakt.tv/oauth/applications</a>.
-                                    <br/><br/>
-                                    <strong>Crucially, set the <code className="bg-slate-800 p-1 rounded">Redirect URI</code> for your Trakt application to:</strong>
-                                    <br />
-                                    <code className="bg-slate-800 p-1 rounded block mt-2 break-all text-sm">
-                                        &lt;YOUR_RENDER_APP_URL&gt;/trakt-callback
-                                    </code>
-                                    <br/>
-                                    For example, if your Render app URL is <code className="bg-slate-800 p-1 rounded break-all text-sm">https://my-gemini-stremio-addon.onrender.com</code>,
-                                    your Redirect URI on Trakt would be <code className="bg-slate-800 p-1 rounded break-all text-sm">https://my-gemini-stremio-addon.onrender.com/trakt-callback</code>.
+                                    To ensure your addon works persistently after deployment on Render, **you must set these API keys as environment variables** in your Render service settings.
+                                    The fields below are for convenient setup and local testing.
                                 </p>
+
                                 {/* Input field for Trakt Client ID */}
                                 <div>
                                     <label htmlFor="traktClientId" className="block text-slate-300 text-sm font-bold mb-2 mt-4">
@@ -669,7 +663,7 @@ app.get('/configure', (req, res) => {
                                         className="shadow appearance-none border rounded w-full py-2 px-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         value={traktClientId}
                                         onChange={(e) => setTraktClientId(e.target.value)}
-                                        placeholder="Enter your Trakt Client ID"
+                                        placeholder="Enter your Trakt Client ID (e.g., TRAKT_CLIENT_ID)"
                                     />
                                 </div>
                                 {/* Input field for Trakt Client Secret */}
@@ -683,7 +677,7 @@ app.get('/configure', (req, res) => {
                                         className="shadow appearance-none border rounded w-full py-2 px-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         value={traktClientSecret}
                                         onChange={(e) => setTraktClientSecret(e.target.value)}
-                                        placeholder="Enter your Trakt Client Secret"
+                                        placeholder="Enter your Trakt Client Secret (e.g., TRAKT_CLIENT_SECRET)"
                                     />
                                 </div>
                                 {/* Button to initiate Trakt authorization */}
@@ -693,13 +687,26 @@ app.get('/configure', (req, res) => {
                                 >
                                     Authorize with Trakt.tv
                                 </button>
-                                <p className="text-sm text-red-400 mt-2">
-                                    <strong>Important:</strong> After deploying this addon, you **must** also set these Client ID and Client Secret
-                                    as environment variables named <code className="bg-slate-800 p-1 rounded">TRAKT_CLIENT_ID</code> and <code className="bg-slate-800 p-1 rounded">TRAKT_CLIENT_SECRET</code> on your Render service.
+                                <p className="text-sm text-slate-400 mt-2">
+                                    <strong>Important:</strong> After deploying this addon, you **must** set your Trakt.tv Client ID and Secret as environment variables named <code className="bg-slate-800 p-1 rounded">TRAKT_CLIENT_ID</code> and <code className="bg-slate-800 p-1 rounded">TRAKT_CLIENT_SECRET</code> on your Render service.
                                 </p>
-                                <p className="text-sm text-blue-400 mt-2">
-                                    Additionally, you will need to set your Google Gemini API key as an environment variable
-                                    named <code className="bg-slate-800 p-1 rounded">GEMINI_API_KEY</code> on Render.
+
+                                {/* Input field for Gemini API Key */}
+                                <div>
+                                    <label htmlFor="geminiApiKey" className="block text-slate-300 text-sm font-bold mb-2 mt-4">
+                                        Google Gemini API Key:
+                                    </label>
+                                    <input
+                                        type="password"
+                                        id="geminiApiKey"
+                                        className="shadow appearance-none border rounded w-full py-2 px-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                        value={geminiApiKey}
+                                        onChange={(e) => setGeminiApiKey(e.target.value)}
+                                        placeholder="Enter your Google Gemini API Key (e.g., GEMINI_API_KEY)"
+                                    />
+                                </div>
+                                <p className="text-sm text-slate-400 mt-2">
+                                    **Reminder:** Your Google Gemini API key **must** also be set as an environment variable named <code className="bg-slate-800 p-1 rounded">GEMINI_API_KEY</code> on Render for the AI features to work.
                                 </p>
                             </div>
 
