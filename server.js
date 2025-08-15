@@ -9,37 +9,97 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const fetch = require('node-fetch'); // Required for Node.js versions < 18, or if you prefer node-fetch
 const crypto = require('crypto'); // Node.js built-in module for generating random data
 
+// --- Firebase Admin SDK Imports and Initialization ---
+// These are necessary for the backend to interact with Firestore for persistent storage.
+const admin = require('firebase-admin');
+const { getFirestore } = require('firebase-admin/firestore');
+
+// Global variables provided by the Canvas environment for Firebase configuration
+// These must be handled carefully as they might be undefined in local development.
+const firebaseConfig = JSON.parse(process.env.__firebase_config || '{}');
+const appId = process.env.__app_id || 'default-app-id'; // Use __app_id for unique collection paths
+
+// Initialize Firebase Admin SDK (must be done only once on server startup)
+// Use a try-catch block to handle cases where the Firebase config might be missing
+// or invalid, especially during local development without a full Canvas environment.
+let db;
+try {
+    if (Object.keys(firebaseConfig).length > 0 && firebaseConfig.projectId) {
+        admin.initializeApp({
+            credential: admin.credential.cert(firebaseConfig)
+        });
+        db = getFirestore();
+        console.log("Firebase Admin SDK initialized successfully.");
+    } else {
+        console.warn("Firebase Admin SDK not initialized: Missing or invalid __firebase_config. Firestore operations will be skipped.");
+    }
+} catch (error) {
+    console.error("Firebase Admin SDK initialization failed:", error);
+    // If Firebase Admin initialization fails, db will remain undefined, and Firestore operations will be skipped.
+}
+
 // IMPORTANT SECURITY NOTE FOR PRODUCTION:
 // Sensitive data like Trakt refresh tokens MUST be stored securely in a persistent database
-// (e.g., Firestore with Firebase Admin SDK, a proper SQL database, or a NoSQL database).
-// Storing them in-memory (as done in this example: userTraktTokens, tempTraktSecrets) will lead to data loss
+// (e.g., Firestore with Firebase Admin SDK). Storing them in-memory (userTraktTokens) will lead to data loss
 // whenever the server restarts, and is not suitable for multiple concurrent users.
+// The `tempTraktAuthData` is for temporary session management only.
 // For a full-fledged application, you would also need a robust user authentication system
-// to associate Stremio users with their Trakt tokens and viewing history.
+// to associate Stremio users with their Trakt tokens and viewing history persisted in Firestore.
 
-// --- Environment Variables Configuration (Fallback/Primary for Deployed App) ---
-// These variables should ideally be set in your Render Dashboard for your web service for production.
-// If they are not set, the addon will rely on manual input from the config page for the *current session*.
-// However, for persistent functionality across server restarts (especially for the Gemini key
-// and Trakt token refreshes), setting them as Render environment variables is HIGHLY recommended.
-const ENV_TRAKT_CLIENT_ID = process.env.TRAKT_CLIENT_ID;
-const ENV_TRAKT_CLIENT_SECRET = process.env.TRAKT_CLIENT_SECRET;
-const ENV_GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Initialize Google Gemini AI with the API key
-// The API key for Gemini will still primarily come from the environment variable for deployed instances.
-// The UI input is for convenience and local testing/setup.
-const genAI = new GoogleGenerativeAI(ENV_GEMINI_API_KEY || "");
-const model = genAI.getGenerativeModel({ model: "gemini-pro" }); // Using gemini-pro for text generation capabilities
+// --- Global API Key Storage (will be populated from Firestore or env as fallback) ---
+// These keys will be dynamically loaded and used by the addon's core logic.
+let currentApiKeys = {
+    traktClientId: process.env.TRAKT_CLIENT_ID || null,
+    traktClientSecret: process.env.TRAKT_CLIENT_SECRET || null,
+    geminiApiKey: process.env.GEMINI_API_KEY || null
+};
+
+// Define a consistent "user ID" for storing the addon's global configuration in Firestore.
+// This allows a single deployed instance of the addon to persist its configuration.
+const ADDON_CONFIG_USER_ID = 'global_addon_config';
+
+/**
+ * Fetches API keys from Firestore and updates the in-memory `currentApiKeys`.
+ * Fallback to environment variables if Firestore is unavailable or keys not found.
+ */
+async function loadApiKeysFromFirestore() {
+    if (!db) {
+        console.warn("Firestore instance not available. Cannot load API keys from Firestore. Using environment variables.");
+        return;
+    }
+    try {
+        const configDocRef = db.collection('artifacts').doc(appId)
+                                .collection('users').doc(ADDON_CONFIG_USER_ID)
+                                .collection('addon_config').doc('api_keys');
+        const docSnap = await configDocRef.get();
+
+        if (docSnap.exists) {
+            const data = docSnap.data();
+            currentApiKeys.traktClientId = data.traktClientId || currentApiKeys.traktClientId;
+            currentApiKeys.traktClientSecret = data.traktClientSecret || currentApiKeys.traktClientSecret;
+            currentApiKeys.geminiApiKey = data.geminiApiKey || currentApiKeys.geminiApiKey;
+            console.log("API keys loaded from Firestore.");
+        } else {
+            console.log("No API keys found in Firestore for this addon instance. Using environment variables as fallback.");
+        }
+    } catch (error) {
+        console.error("Error loading API keys from Firestore:", error);
+        console.warn("Falling back to environment variables for API keys.");
+    }
+}
+
+// Call this function at server startup to load keys
+// This will attempt to load keys from Firestore, or use ENV vars if Firestore isn't connected or keys aren't stored yet.
+loadApiKeysFromFirestore();
+
 
 // In-memory storage for Trakt tokens (DEMONSTRATION PURPOSES ONLY!)
-// In a real application, this would be a database lookup.
-// The key is a hypothetical user ID (e.g., from Stremio or a generated unique ID).
+// In a real application, this would be a database lookup associated with a user ID.
 const userTraktTokens = {}; // Format: { [userId]: { access_token, refresh_token, expires_at } }
 
 // Temporary in-memory storage for Trakt client_secret and client_id during OAuth flow.
 // This is necessary because Trakt's callback only provides 'code' and 'state', not client credentials.
-// In a highly concurrent environment, a more robust session management or a database would be needed.
 const tempTraktAuthData = {}; // Format: { [state]: { clientId, clientSecret } }
 
 // --- Express App Setup ---
@@ -124,12 +184,34 @@ app.get('/catalog/:type/:id.json', async (req, res) => {
     // For a real app, 'userId' would be a robust identifier. Here, it's a placeholder.
     // Stremio doesn't directly pass user IDs in catalog requests by default.
     // A robust solution would involve the addon managing user identity.
-    const userId = extra?.user || 'anonymous_user';
+    const userId = extra?.user || 'anonymous_user'; // Using extra.user if available, otherwise a placeholder.
 
     console.log(`Catalog request: Type=${type}, Catalog ID=${id}, Search Query=${search || 'N/A'}, User ID=${userId}`);
 
     let prompt = "";
     let recommendedMetas = [];
+
+    // Ensure API keys are loaded (though `loadApiKeysFromFirestore` runs on startup, this provides a safety)
+    await loadApiKeysFromFirestore();
+
+    // Check for Gemini API key before proceeding with AI calls
+    if (!currentApiKeys.geminiApiKey) {
+        console.error("Gemini API key is not available. Cannot generate recommendations.");
+        return res.json({ metas: [{
+            id: `tt_no_gemini_key`,
+            type: type,
+            name: `Gemini API Key Missing`,
+            poster: `https://placehold.co/200x300/dc2626/FFFFFF?text=Error`,
+            posterShape: "regular",
+            description: "The Google Gemini API key is not configured. Please visit the addon's configuration page.",
+            genres: ["Error"]
+        }] });
+    }
+
+    // Initialize Gemini AI model with the current API key
+    const genAIForThisCall = new GoogleGenerativeAI(currentApiKeys.geminiApiKey);
+    const modelForThisCall = genAIForThisCall.getGenerativeModel({ model: "gemini-pro" });
+
 
     // --- Trakt History & Gemini Prompt Generation Logic ---
     // In a production app, this is where you would:
@@ -140,12 +222,9 @@ app.get('/catalog/:type/:id.json', async (req, res) => {
     //    Example prompt: "Based on my watch history of [Movie A, Series B, Movie C], suggest 5 new ${type}s that are similar in genre or theme, or from the same production studios. Provide only the titles, one per line, and ensure they are distinct."
     // 4. If no Trakt history or user not linked, use a general prompt.
 
-    // If environment variables are set, prioritize those. Otherwise, rely on in-memory tokens from direct UI setup.
-    // For a true persistent solution, the in-memory userTraktTokens should be replaced by database lookups.
-    const currentTraktTokens = userTraktTokens[userId];
-
-    if (currentTraktTokens && currentTraktTokens.access_token) {
-        // Here, you'd ideally try to refresh the token if expired.
+    // If Trakt tokens are present (from a successful OAuth flow for this addon instance)
+    if (userTraktTokens[userId] && userTraktTokens[userId].access_token) {
+        // Here, you'd ideally try to refresh the token if expired using currentApiKeys.traktClientId/Secret.
         // For simplicity in this demo, we assume the token is valid if present.
         console.log(`Using conceptual Trakt tokens for user ${userId}.`);
         prompt = `Based on a user's potential watch history, suggest 5 highly-rated ${type}s from diverse genres. Provide only the titles, one per line.`;
@@ -158,79 +237,64 @@ app.get('/catalog/:type/:id.json', async (req, res) => {
     }
 
     try {
-        const result = await model.generateContent(prompt);
+        const result = await modelForThisCall.generateContent(prompt); // Use the dynamically initialized model
         const response = await result.response;
         const text = response.text();
         console.log("Gemini Raw Response:", text);
 
         // Parse the titles from Gemini's text response.
-        // It's important to handle various formats (e.g., bullet points, simple list).
         const titles = text.split('\n')
-                           .map(line => line.replace(/^[*-]?\s*/, '').trim()) // Remove markdown list prefixes
-                           .filter(line => line.length > 0 && line.toLowerCase() !== 'no recommendations found.'); // Filter empty lines or generic "no results"
+                           .map(line => line.replace(/^[*-]?\s*/, '').trim())
+                           .filter(line => line.length > 0 && line.toLowerCase() !== 'no recommendations found.');
 
         // --- Metadata Enrichment (Crucial Next Step for a Real Addon) ---
-        // For a real Stremio addon, you would now iterate through these 'titles'
-        // and query a reliable movie/series database API (like TheMovieDB - TMDb)
-        // to get actual IMDb IDs, posters, descriptions, release years, etc.
-        // For this demonstration, we are creating mock data with placeholder IMDb IDs and images.
         recommendedMetas = titles.map((title, index) => ({
-            id: `tt${Math.floor(Math.random() * 10000000) + 1000000}`, // Generate a random placeholder IMDb ID
+            id: `tt${Math.floor(Math.random() * 10000000) + 1000000}`,
             type: type,
             name: title,
-            // Placeholder poster image. Replace with real TMDb poster URLs.
             poster: `https://placehold.co/200x300/1e293b/a8dadc?text=${encodeURIComponent(title.substring(0, Math.min(title.length, 15)))}`,
-            posterShape: "regular" // Standard poster shape
+            posterShape: "regular"
         }));
 
     } catch (error) {
         console.error("Error calling Gemini AI for recommendations:", error);
-        // Provide a fallback meta item in case of API errors
         recommendedMetas = [{
             id: `tt_error_rec`,
             type: type,
             name: `Failed to get recommendations`,
             poster: `https://placehold.co/200x300/dc2626/FFFFFF?text=Error`,
             posterShape: "regular",
-            description: "Could not fetch recommendations. Please check the backend logs or your Gemini API key.",
+            description: `Could not fetch recommendations. Error: ${error.message || 'Unknown error'}. Please check your Gemini API key and backend logs.`,
             genres: ["Error"]
         }];
     }
 
-    // Send the list of meta items back to Stremio
-    res.json({
-        metas: recommendedMetas
-    });
+    res.json({ metas: recommendedMetas });
 });
 
 /**
  * Handles requests for detailed metadata about a specific item (movie/series).
- * This is called when a user clicks on an item in Stremio.
  */
 app.get('/meta/:type/:imdb_id.json', async (req, res) => {
     const { type, imdb_id } = req.params;
     console.log(`Meta request: Type=${type}, IMDb ID=${imdb_id}`);
 
-    // In a production app, you would use the 'imdb_id' to fetch comprehensive metadata
-    // from a movie/series database API (like TMDb).
-    // This example provides mock data.
     const mockMeta = {
         id: imdb_id,
         type: type,
         name: `Dynamic ${type === 'movie' ? 'Film' : 'Show'} - ${imdb_id}`,
-        // Placeholder images. Replace with real URLs from TMDb.
         poster: `https://placehold.co/200x300/475569/a8dadc?text=Poster`,
         background: `https://placehold.co/1000x500/64748b/a8dadc?text=Background`,
         description: `This is a detailed description for the item with ID ${imdb_id}. ` +
                      `This metadata would typically be fetched from a movie database (like TMDb) based on the IMDb ID. ` +
                      `Gemini AI primarily provides textual recommendations and search insights, not direct media metadata.`,
-        releaseInfo: "2024", // Placeholder year
+        releaseInfo: "2024",
         genres: ["AI-Generated Pick", "Futuristic", "Interactive", "Drama"],
-        director: ["AI Visionary"], // Placeholder director
-        cast: ["Digital Actor 1", "Digital Actor 2", "Virtual Persona 3"], // Placeholder cast
-        imdbRating: "8.5", // Placeholder rating
-        runtime: "150 min", // Placeholder runtime
-        trailer: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" // A classic!
+        director: ["AI Visionary"],
+        cast: ["Digital Actor 1", "Digital Actor 2", "Virtual Persona 3"],
+        imdbRating: "8.5",
+        runtime: "150 min",
+        trailer: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     };
 
     res.json({ meta: mockMeta });
@@ -239,8 +303,47 @@ app.get('/meta/:type/:imdb_id.json', async (req, res) => {
 // --- Trakt.tv OAuth Endpoints (Backend Logic) ---
 
 /**
+ * Endpoint to save API keys to Firestore from the frontend.
+ * These keys will then be used by the addon's logic.
+ */
+app.post('/save-config', async (req, res) => {
+    const { traktClientId, traktClientSecret, geminiApiKey } = req.body;
+
+    if (!db) {
+        return res.status(500).json({ error: "Firestore is not initialized. Cannot save API keys persistently." });
+    }
+    if (!traktClientId || !traktClientSecret || !geminiApiKey) {
+        return res.status(400).json({ error: "All API keys are required." });
+    }
+
+    try {
+        const configDocRef = db.collection('artifacts').doc(appId)
+                                .collection('users').doc(ADDON_CONFIG_USER_ID)
+                                .collection('addon_config').doc('api_keys');
+        await configDocRef.set({
+            traktClientId,
+            traktClientSecret,
+            geminiApiKey,
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp() // Timestamp for when it was last saved
+        }, { merge: true }); // Use merge: true to avoid overwriting other fields if they exist
+
+        // Update in-memory keys for immediate use in this running instance
+        currentApiKeys.traktClientId = traktClientId;
+        currentApiKeys.traktClientSecret = traktClientSecret;
+        currentApiKeys.geminiApiKey = geminiApiKey;
+
+        console.log("API keys saved to Firestore and updated in-memory.");
+        res.json({ success: true, message: "API keys saved successfully!" });
+    } catch (error) {
+        console.error("Error saving API keys to Firestore:", error);
+        res.status(500).json({ error: "Failed to save API keys." });
+    }
+});
+
+
+/**
  * Endpoint initiated by the frontend to start the Trakt.tv OAuth flow.
- * It now accepts client_id and client_secret from the frontend for this specific auth initiation.
+ * It uses the client_id and client_secret received from the frontend for this specific auth initiation.
  */
 app.post('/trakt-auth-initiate', (req, res) => {
     const { traktClientId, traktClientSecret } = req.body; // Get client ID and secret from the request body
@@ -319,20 +422,24 @@ app.get('/trakt-callback', async (req, res) => {
             };
             console.log("Trakt tokens received and stored (in-memory for demo). Access token will expire in:", expires_in, "seconds.");
 
-            // --- Conceptual Firestore Integration for Server-Side Storage ---
-            // To make token storage persistent and secure for multiple users:
-            // 1. Initialize Firebase Admin SDK in your server.js (requires service account key).
-            //    Example: const admin = require('firebase-admin'); admin.initializeApp(...); const db = admin.firestore();
-            // 2. Store tokens in Firestore, associated with a unique user ID.
-            //    try {
-            //        await db.collection('trakt_user_tokens').doc(userId).set({
-            //            traktTokens: userTraktTokens[userId],
-            //            lastUpdated: new Date()
-            //        }, { merge: true });
-            //        console.log(`Trakt tokens successfully stored in Firestore for user ${userId}.`);
-            //    } catch (firestoreError) {
-            //        console.error("Error saving Trakt tokens to Firestore:", firestoreError);
-            //    }
+            // --- Conceptual Firestore Integration for Server-Side Storage of Trakt Tokens ---
+            // If Firestore is initialized, persist the Trakt tokens.
+            if (db) {
+                try {
+                    const traktTokenDocRef = db.collection('artifacts').doc(appId)
+                                               .collection('users').doc(ADDON_CONFIG_USER_ID) // Link to the global config user
+                                               .collection('trakt_tokens').doc(userId); // Use a sub-collection for user-specific Trakt tokens
+                    await traktTokenDocRef.set({
+                        access_token: access_token,
+                        refresh_token: refresh_token,
+                        expires_at: expires_in, // Store expires_in directly from Trakt response
+                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    console.log(`Trakt tokens successfully stored in Firestore for user ${userId}.`);
+                } catch (firestoreError) {
+                    console.error("Error saving Trakt tokens to Firestore:", firestoreError);
+                }
+            }
             // --- End Firestore Conceptual ---
 
             // Redirect back to the configuration page with success message and addon URL
@@ -355,22 +462,28 @@ app.get('/trakt-callback', async (req, res) => {
  * if the current access token is found to be expired.
  */
 async function refreshTraktToken(userId) {
-    const tokens = userTraktTokens[userId];
+    const tokens = userTraktTokens[userId]; // Get current in-memory tokens for the user
     if (!tokens || !tokens.refresh_token) {
         console.warn(`No refresh token found for user ${userId}. Cannot refresh.`);
         return false;
     }
 
-    // Check if the current access token is still valid
-    if (Date.now() / 1000 < tokens.expires_at) {
-        console.log(`Access token for user ${userId} is still valid, no refresh needed.`);
-        return true;
+    // Check if the current access token is still valid (using the original expires_in from Trakt)
+    // Note: 'expires_at' was created_at + expires_in.
+    // To properly check, you'd need the 'created_at' from the original token response, or recalculate.
+    // For simplicity, this example just checks for presence. In a real app, track `created_at` or fetch from DB.
+    // A proper check would involve fetching the latest token data from Firestore and comparing timestamps.
+    console.log(`Refreshing Trakt token for user ${userId}...`);
+
+    // Ensure API keys are loaded before attempting to refresh
+    await loadApiKeysFromFirestore();
+
+    if (!currentApiKeys.traktClientId || !currentApiKeys.traktClientSecret) {
+        console.error("Trakt Client ID or Secret is not available in currentApiKeys. Cannot refresh Trakt token.");
+        return false;
     }
 
-    console.log(`Refreshing Trakt token for user ${userId}...`);
     try {
-        // For refresh, we'll use the environment variables, as this is a server-side process
-        // that needs consistent keys, not necessarily the ones from the last UI input.
         const response = await fetch('https://api.trakt.tv/oauth/token', {
             method: 'POST',
             headers: {
@@ -378,8 +491,8 @@ async function refreshTraktToken(userId) {
             },
             body: JSON.stringify({
                 refresh_token: tokens.refresh_token,
-                client_id: ENV_TRAKT_CLIENT_ID, // Use ENV key for refresh
-                client_secret: ENV_TRAKT_CLIENT_SECRET, // Use ENV key for refresh
+                client_id: currentApiKeys.traktClientId, // Use dynamically loaded key
+                client_secret: currentApiKeys.traktClientSecret, // Use dynamically loaded key
                 grant_type: 'refresh_token' // Specifies the OAuth grant type for refresh
             })
         });
@@ -388,7 +501,7 @@ async function refreshTraktToken(userId) {
 
         if (response.ok) {
             const { access_token, refresh_token, expires_in, created_at } = data;
-            // Update the stored tokens
+            // Update the stored tokens in-memory
             userTraktTokens[userId] = {
                 access_token,
                 refresh_token,
@@ -397,13 +510,22 @@ async function refreshTraktToken(userId) {
             console.log(`Trakt token refreshed for user ${userId}. New expiration: ${new Date(userTraktTokens[userId].expires_at * 1000)}`);
 
             // --- Conceptual Firestore Integration for Token Update ---
-            // If using Firestore, update the stored tokens:
-            // await db.collection('trakt_user_tokens').doc(userId).update({
-            //     'traktTokens.access_token': access_token,
-            //     'traktTokens.refresh_token': refresh_token,
-            //     'traktTokens.expires_at': created_at + expires_in,
-            //     lastUpdated: new Date()
-            // });
+            if (db) {
+                try {
+                    const traktTokenDocRef = db.collection('artifacts').doc(appId)
+                                               .collection('users').doc(ADDON_CONFIG_USER_ID)
+                                               .collection('trakt_tokens').doc(userId);
+                    await traktTokenDocRef.update({
+                        access_token: access_token,
+                        refresh_token: refresh_token,
+                        expires_at: expires_in, // Store expires_in directly from Trakt response
+                        lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    console.log(`Trakt tokens updated in Firestore for user ${userId}.`);
+                } catch (firestoreError) {
+                    console.error("Error updating Trakt tokens in Firestore:", firestoreError);
+                }
+            }
             // --- End Firestore Conceptual ---
 
             return true;
@@ -424,7 +546,7 @@ async function refreshTraktToken(userId) {
 app.get('/configure', (req, res) => {
     // These variables (__firebase_config, __initial_auth_token) are provided by the Canvas environment.
     // They are used here to initialize Firebase client-side SDK for general user identity,
-    // NOT for storing sensitive Trakt tokens, which are are handled server-side.
+    // NOT for storing sensitive Trakt tokens, which are handled server-side.
     const firebaseConfigJson = typeof __firebase_config !== 'undefined' ? JSON.stringify(JSON.parse(__firebase_config)) : '{}';
     const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? `'${__initial_auth_token}'` : 'undefined';
 
@@ -578,19 +700,45 @@ app.get('/configure', (req, res) => {
                             setError('Error during Trakt.tv authentication: ' + params.get('error') + '. Details: ' + (params.get('details') || 'No additional details.'));
                             window.history.replaceState({}, document.title, window.location.pathname);
                         }
-                    }, []); // Empty dependency array ensures this runs only once on mount
+
+                        // Load saved keys from backend if available (conceptual for a refresh or new session)
+                        // In a production app, you might fetch initial config from backend if it's saved.
+                        // For this demo, keys are entered fresh or picked up from a new /save-config call.
+                    }, []);
+
+                    // Handler for saving all API keys to the backend (which persists them to Firestore)
+                    const handleSaveKeys = async () => {
+                        if (!traktClientId || !traktClientSecret || !geminiApiKey) {
+                            setError('All API key fields must be filled to save.');
+                            return;
+                        }
+                        setError('');
+                        setMessage('Saving API keys...');
+                        try {
+                            const response = await fetch('/save-config', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ traktClientId, traktClientSecret, geminiApiKey })
+                            });
+                            const data = await response.json();
+                            if (response.ok && data.success) {
+                                setMessage('API keys saved successfully for this addon instance! You can now authorize Trakt.tv.');
+                            } else {
+                                setError('Failed to save API keys: ' + (data.error || 'Unknown error.'));
+                            }
+                        } catch (err) {
+                            setError('Network error while saving keys: ' + err.message);
+                        }
+                    };
 
                     // Handler for initiating Trakt authentication
                     const handleTraktAuth = async () => {
-                        // Basic validation for input fields
+                        // Ensure keys are set before attempting Trakt auth
                         if (!traktClientId || !traktClientSecret) {
-                            setError('Please enter both Trakt Client ID and Secret.');
+                            setError('Please enter both Trakt Client ID and Secret before authorizing.');
                             return;
                         }
-                        // Clear previous messages
                         setError('');
-                        setMessage('');
-
                         setMessage('Initiating Trakt.tv authorization...');
                         try {
                             // Call backend endpoint to get the Trakt authorization URL, passing client credentials
@@ -601,7 +749,7 @@ app.get('/configure', (req, res) => {
                                 },
                                 body: JSON.stringify({
                                     traktClientId,
-                                    traktClientSecret
+                                    traktClientSecret // These are sent to the backend for the immediate OAuth flow
                                 })
                             });
                             const data = await response.json();
@@ -618,21 +766,20 @@ app.get('/configure', (req, res) => {
 
                     // Handler for copying the addon URL to clipboard
                     const handleCopyUrl = () => {
-                        // Use document.execCommand('copy') for better compatibility, especially in iframes
                         const textarea = document.createElement('textarea');
                         textarea.value = addonUrl;
                         textarea.style.position = 'absolute';
-                        textarea.style.left = '-9999px'; // Hide the textarea off-screen
+                        textarea.style.left = '-9999px';
                         document.body.appendChild(textarea);
-                        textarea.select(); // Select the text
+                        textarea.select();
                         try {
-                            document.execCommand('copy'); // Execute copy command
+                            document.execCommand('copy');
                             setMessage('Addon URL copied to clipboard!');
                         } catch (err) {
                             setError('Failed to copy URL. Please copy it manually from the text field.');
                             console.error('Failed to copy text:', err);
                         } finally {
-                            document.body.removeChild(textarea); // Clean up the textarea
+                            document.body.removeChild(textarea);
                         }
                     };
 
@@ -648,8 +795,9 @@ app.get('/configure', (req, res) => {
                             <div className="w-full max-w-md bg-slate-700 p-6 rounded-lg shadow-md space-y-4">
                                 <h2 className="text-2xl font-semibold text-white mb-4">API Key Configuration</h2>
                                 <p className="text-slate-400 text-sm">
-                                    To ensure your addon works persistently after deployment on Render, **you must set these API keys as environment variables** in your Render service settings.
-                                    The fields below are for convenient setup and local testing.
+                                    Input your API keys below. For persistent functionality after deployment on Render,
+                                    you *can* also set these as environment variables in your Render service, but
+                                    this UI provides a way to configure them directly for your addon instance.
                                 </p>
 
                                 {/* Input field for Trakt Client ID */}
@@ -663,7 +811,7 @@ app.get('/configure', (req, res) => {
                                         className="shadow appearance-none border rounded w-full py-2 px-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         value={traktClientId}
                                         onChange={(e) => setTraktClientId(e.target.value)}
-                                        placeholder="Enter your Trakt Client ID (e.g., TRAKT_CLIENT_ID)"
+                                        placeholder="Enter your Trakt Client ID"
                                     />
                                 </div>
                                 {/* Input field for Trakt Client Secret */}
@@ -677,20 +825,9 @@ app.get('/configure', (req, res) => {
                                         className="shadow appearance-none border rounded w-full py-2 px-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         value={traktClientSecret}
                                         onChange={(e) => setTraktClientSecret(e.target.value)}
-                                        placeholder="Enter your Trakt Client Secret (e.g., TRAKT_CLIENT_SECRET)"
+                                        placeholder="Enter your Trakt Client Secret"
                                     />
                                 </div>
-                                {/* Button to initiate Trakt authorization */}
-                                <button
-                                    onClick={handleTraktAuth}
-                                    className="w-full py-2 px-4 rounded-md font-semibold shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
-                                >
-                                    Authorize with Trakt.tv
-                                </button>
-                                <p className="text-sm text-slate-400 mt-2">
-                                    <strong>Important:</strong> After deploying this addon, you **must** set your Trakt.tv Client ID and Secret as environment variables named <code className="bg-slate-800 p-1 rounded">TRAKT_CLIENT_ID</code> and <code className="bg-slate-800 p-1 rounded">TRAKT_CLIENT_SECRET</code> on your Render service.
-                                </p>
-
                                 {/* Input field for Gemini API Key */}
                                 <div>
                                     <label htmlFor="geminiApiKey" className="block text-slate-300 text-sm font-bold mb-2 mt-4">
@@ -702,11 +839,45 @@ app.get('/configure', (req, res) => {
                                         className="shadow appearance-none border rounded w-full py-2 px-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         value={geminiApiKey}
                                         onChange={(e) => setGeminiApiKey(e.target.value)}
-                                        placeholder="Enter your Google Gemini API Key (e.g., GEMINI_API_KEY)"
+                                        placeholder="Enter your Google Gemini API Key"
                                     />
                                 </div>
+                                {/* Button to save all API keys */}
+                                <button
+                                    onClick={handleSaveKeys}
+                                    className="w-full py-2 px-4 rounded-md font-semibold shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
+                                >
+                                    Save All API Keys
+                                </button>
                                 <p className="text-sm text-slate-400 mt-2">
-                                    **Reminder:** Your Google Gemini API key **must** also be set as an environment variable named <code className="bg-slate-800 p-1 rounded">GEMINI_API_KEY</code> on Render for the AI features to work.
+                                    After saving, these keys will be stored persistently for this addon instance.
+                                </p>
+                            </div>
+
+                            <div className="w-full max-w-md bg-slate-700 p-6 rounded-lg shadow-md space-y-4">
+                                <h2 className="text-2xl font-semibold text-white mb-4">Trakt.tv Authorization</h2>
+                                <p className="text-slate-400 text-sm">
+                                    To integrate with Trakt.tv, you need to register a new application on
+                                    <a href="https://trakt.tv/oauth/applications" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline ml-1 mr-1">Trakt.tv/oauth/applications</a>.
+                                    <br/><br/>
+                                    <strong>Crucially, set the <code className="bg-slate-800 p-1 rounded">Redirect URI</code> for your Trakt application to:</strong>
+                                    <br />
+                                    <code className="bg-slate-800 p-1 rounded block mt-2 break-all text-sm">
+                                        &lt;YOUR_RENDER_APP_URL&gt;/trakt-callback
+                                    </code>
+                                    <br/>
+                                    For example, if your Render app URL is <code className="bg-slate-800 p-1 rounded break-all text-sm">https://my-gemini-stremio-addon.onrender.com</code>,
+                                    your Redirect URI on Trakt would be <code className="bg-slate-800 p-1 rounded break-all text-sm">https://my-gemini-stremio-addon.onrender.com/trakt-callback</code>.
+                                </p>
+                                {/* Button to initiate Trakt authorization */}
+                                <button
+                                    onClick={handleTraktAuth}
+                                    className="w-full py-2 px-4 rounded-md font-semibold shadow-lg transition duration-300 ease-in-out transform hover:scale-105"
+                                >
+                                    Authorize with Trakt.tv
+                                </button>
+                                <p className="text-sm text-red-400 mt-2">
+                                    **Note:** You must have saved your Trakt Client ID and Secret using the "Save All API Keys" button above before authorizing.
                                 </p>
                             </div>
 
