@@ -1,0 +1,16 @@
+{
+  "name": "stremio-gemini-addon",
+  "version": "1.0.0",
+  "description": "A Stremio addon using Google Gemini, TMDB, and RPDB APIs.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "stremio-addon-sdk": "^1.5.0"
+  }
+}
